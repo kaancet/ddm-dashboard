@@ -1,12 +1,5 @@
-""" Fitting
-
-param_names:    the parameters and their order
-build_model:    parameters -> model
-log_likelihood: trial-wise log-likelihood in PyTorch, the one used for fitting
-fit_trials:     Bayesian fit of the trial-wise likelihood (posterior samples)
-map_estimate:   parameter vector of highest likelihood, found from the posterior mean
-"""
 import math
+from typing import Callable, Literal
 
 import numpy as np
 import polars as pl
@@ -14,62 +7,64 @@ import torch
 from sbi.inference.posteriors import MCMCPosterior
 from sbi.utils import BoxUniform, mcmc_transform
 from scipy.optimize import minimize
+from torch import Tensor
 from torch.special import log_ndtr, ndtr
 
-from .model import (MIN_C, THRESHOLD, DiffusionParams, GateParams, GatedDiffusion, GatedDiffusionMixture,
+from .model import (EPS, MIN_C, THRESHOLD, DiffusionParams, GateParams, GatedDiffusion, GatedDiffusionMixture,
                     GatedDiffusionRace, LapseParams, TaskParams)
+
+Params = dict[str, float]       # parameter name -> value
 
 
 # --- parameters ---
 
-# The parameters, in the order of the flat vectors used inside the fits:
-#   gain, gamma, sigma, ceiling, then scale_<stim> and shape_<stim> for each stimulus,
-#   lapse_prob (lapse variants only), t0, c50 (saturating drift only)
-# This is the only place the order is defined: everywhere else a parameter is found by its name.
-# A parameter that is not fitted is held at a value with the `fixed` argument of the fit functions,
-# e.g. t0 at the floor, or lapse_prob at the catch-trial hit rate.
-# saturating: if True (default), the drift saturates with contrast and has a c50; if False, it is a power law
-def param_names(stims, model=GatedDiffusion, saturating=True):
-    names = ["gain", "gamma", "sigma", "ceiling"] + [f"{p}_{s}" for s in stims for p in ("scale", "shape")]
-    if model is not GatedDiffusion:
-        names.append("lapse_prob")
+def param_names(stims: list[str], saturating: bool = True) -> list[str]:
+    """ Parameter names, in the order of the flat vectors used in the fits. The only place the order is defined
+
+    saturating: the drift saturates with contrast and has a c50; otherwise it is a power law
+    """
+    names = ["gain", "gamma", "sigma", "ceiling"] + [f"{kind}_{s}" for s in stims for kind in ("scale", "shape")]
     names.append("t0")
     if saturating:
         names.append("c50")
     return names
 
 
-# allowed range of each parameter: the uniform prior of the Bayesian fit.
-# scale and shape apply to every stimulus
+# uniform prior range of each parameter. scale and shape apply to every stimulus
 BOUNDS = {"gain": (1e-3, 100.), "gamma": (1e-3, 3.), "sigma": (1e-3, 5.), "ceiling": (0.5, 1.0),
-          "scale": (1e-3, 1.0), "shape": (0.1, 10.), "lapse_prob": (1e-3, 0.999),
+          "scale": (1e-3, 1.0), "shape": (0.1, 10.),
           "t0": (0.0, 0.3),         # s
           "c50": (1e-3, 1.0)}       # contrast
 
 
-# (low, high) for the given parameter names
-def param_bounds(names):
-    low, high = zip(*(BOUNDS[name] if name in BOUNDS else BOUNDS[name.split("_")[0]] for name in names))
+def param_bounds(names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """ (low, high) for the given parameter names """
+    kinds = [name if name in BOUNDS else name.split("_")[0] for name in names]
+    bounds = [BOUNDS[kind] for kind in kinds]
+    low, high = zip(*bounds)
     return np.array(low), np.array(high)
 
 
-# parameters -> model
-# theta: dict parameter name -> value, with the names of `param_names`. Without a c50 the drift is a power law
-# lapse_dist: lapse-time shape, "uniform" (flat over the window) or "invgauss" (inverse Gaussian timed
-#             from stimulus onset, with fixed mean time lapse_tau (s) and shape lapse_shape)
-def build_model(theta, stims, model=GatedDiffusion, task=None, lapse_dist="uniform", lapse_tau=None, lapse_shape=None):
-    expected = param_names(stims, model, saturating="c50" in theta)
-    if set(theta) != set(expected):
-        raise ValueError(f"missing parameters: {sorted(set(expected) - set(theta))}, unknown parameters: {sorted(set(theta) - set(expected))}")
-    diffusion = DiffusionParams(theta["gain"], theta["gamma"], theta["sigma"], theta["t0"], theta.get("c50"))
-    gates = {s: GateParams(theta[f"scale_{s}"], theta[f"shape_{s}"], theta["ceiling"]) for s in stims}   # the ceiling is shared
-    if model is GatedDiffusion:
-        return model(gates, diffusion, task)
-    return model(gates, diffusion, LapseParams(theta["lapse_prob"], lapse_dist, lapse_tau, lapse_shape), task)
+def build_model(params: Params, stims: list[str], variant: type[GatedDiffusion] = GatedDiffusion,
+                task: TaskParams | None = None, lapse: LapseParams | None = None) -> GatedDiffusion:
+    """ Parameters -> model of the given variant. Without a c50 the drift is a power law
+
+    lapse: needed by the lapse variants
+    """
+    expected = param_names(stims, saturating="c50" in params)
+    if set(params) != set(expected):
+        raise ValueError(f"missing parameters: {sorted(set(expected) - set(params))}, "
+                         f"unknown parameters: {sorted(set(params) - set(expected))}")
+    diffusion = DiffusionParams(params["gain"], params["gamma"], params["sigma"], params["t0"], params.get("c50"))
+    # the ceiling is shared
+    gates = {s: GateParams(params[f"scale_{s}"], params[f"shape_{s}"], params["ceiling"]) for s in stims}
+    if variant is GatedDiffusion:
+        return variant(gates, diffusion, task)
+    return variant(gates, diffusion, lapse, task)
 
 
-# the parameters held fixed, checked against the parameter names
-def _fixed(fixed, names):
+def _check_fixed(fixed: Params | None, names: list[str]) -> Params:
+    """ The fixed parameters, checked against the parameter names """
     fixed = dict(fixed or {})
     if unknown := set(fixed) - set(names):
         raise ValueError(f"unknown fixed parameters: {sorted(unknown)}, expected names from {list(names)}")
@@ -77,20 +72,13 @@ def _fixed(fixed, names):
 
 
 # --- trial-wise log-likelihood in PyTorch ---
-#
-# The same maths as `log_likelihood` in model.py, written with tensors so that many parameter
-# vectors (one per MCMC chain) are evaluated in a single call.
-#
-# Every hit is scored on its reaction time, catch trials included. A catch-trial hit is a pure lapse, so
-# its term is log(lapse prob) + log(lapse timing density). The timing has no fitted parameters, so catch
-# reaction times add a constant and cannot move any estimate.
+# The maths of `log_likelihood` in model.py, with one row of parameters per MCMC chain
 
-EPS = torch.finfo(torch.float64).tiny   # floor for probabilities before taking the log
 MIN_T = 1e-9    # stands in for times at or before the start of a process (density and cdf are 0 there)
 
 
-# inverse-Gaussian first-passage pdf and cdf at time t, for mean mu and shape lam
-def _fpt(t, mu, lam):
+def _fpt(t: Tensor, mu: Tensor, lam: Tensor) -> tuple[Tensor, Tensor]:
+    """ Inverse-Gaussian first-passage pdf and cdf at time t, for mean mu and shape lam """
     t = t.clamp(min=MIN_T)
     pdf = torch.sqrt(lam / (2 * math.pi * t ** 3)) * torch.exp(-lam * (t - mu) ** 2 / (2 * mu ** 2 * t))
     a = torch.sqrt(lam / t)
@@ -99,32 +87,39 @@ def _fpt(t, mu, lam):
     return pdf, cdf
 
 
-# lapse density f_L and survival S_L (no lapse yet) at reaction time rt, given p(lapse in the window) = p
-def _lapse(rt, p, floor, window, lapse_dist, lapse_tau, lapse_shape):
-    if lapse_dist == "uniform":                     # flat density p / window over the window
-        return (p / window).expand(-1, len(rt)), 1 - p * (rt - floor) / window
-    if lapse_dist == "invgauss":                    # timed from stimulus onset, restricted to the window
-        mu, lam = torch.tensor(lapse_tau, dtype=rt.dtype), torch.tensor(lapse_shape, dtype=rt.dtype)
-        start, end = _fpt(torch.tensor([floor, floor + window], dtype=rt.dtype), mu, lam)[1]    # cdf at the window edges
+def _lapse_pdf_sf(rt: Tensor, lapse: LapseParams, floor: float, window: float) -> tuple[Tensor, Tensor]:
+    """ Lapse density f_L and survival S_L at reaction time rt """
+    p = lapse.prob
+    if lapse.dist == "uniform":                     # flat density p / window over the window
+        return torch.full_like(rt, p / window), 1 - p * (rt - floor) / window
+    if lapse.dist == "invgauss":                    # timed from stimulus onset, restricted to the window
+        mu, lam = torch.tensor(lapse.mu, dtype=rt.dtype), torch.tensor(lapse.lam, dtype=rt.dtype)
+        window_edges = torch.tensor([floor, floor + window], dtype=rt.dtype)
+        start, end = _fpt(window_edges, mu, lam)[1]    # cdf at the edges
+        in_window = end - start
         timing, done = _fpt(rt, mu, lam)
-        return p * timing / (end - start), 1 - p * (done - start) / (end - start)
-    raise ValueError(f"unknown lapse dist: {lapse_dist}")
+        density = p * timing / in_window
+        survival = 1 - p * (done - start) / in_window
+        return density, survival
+    raise ValueError(f"unknown lapse dist: {lapse.dist}")
 
 
-# theta: (n_chains, n_params), float64, with one column per entry of `names` (from `param_names`).
-#        Without a c50 column the drift is a power law
-# stim_index, contrast, hit, rt: one entry per trial, with stim_index the position of the trial's
-#        stimulus in the stims list given to `param_names`
-# returns the log-likelihood summed over trials, shape (n_chains,)
-def log_likelihood(theta, names, stim_index, contrast, hit, rt, model=GatedDiffusion, task=None,
-                   lapse_dist="uniform", lapse_tau=None, lapse_shape=None):
+def log_likelihood(theta: Tensor, names: list[str], stim_index: Tensor, contrast: Tensor, hit: Tensor, rt: Tensor,
+                   variant: type[GatedDiffusion] = GatedDiffusion, task: TaskParams | None = None,
+                   lapse: LapseParams | None = None) -> Tensor:
+    """ Log-likelihood summed over trials, shape (n_chains,)
+
+    theta: (n_chains, n_params), one column per entry of names. Without a c50 column the drift is a power law
+    stim_index: position of each trial's stimulus in the stims list given to `param_names`
+    lapse: needed by the lapse variants
+    """
     task = task or TaskParams()
     floor, window = task.floor, task.deadline - task.floor
 
     theta = theta[:, :, None]                       # (n_chains, n_params, 1): broadcasts over trials
     column = {name: theta[:, i] for i, name in enumerate(names)}
     gain, gamma, sigma, ceiling, t0 = (column[name] for name in ("gain", "gamma", "sigma", "ceiling", "t0"))
-    # gate parameters of each trial's stimulus, (n_chains, n_trials). The stimuli are in the order of `names`
+    # gate parameters of each trial's stimulus, (n_chains, n_trials). The stimuli are in the order of names
     scale = torch.cat([column[name] for name in names if name.startswith("scale_")], dim=1)[:, stim_index]
     shape = torch.cat([column[name] for name in names if name.startswith("shape_")], dim=1)[:, stim_index]
 
@@ -145,15 +140,15 @@ def log_likelihood(theta, names, stim_index, contrast, hit, rt, model=GatedDiffu
     # p(no response before the floor): only the evidence process can respond that early
     not_early = 1 - q * F_E_floor
 
-    if model is GatedDiffusion:
+    if variant is GatedDiffusion:
         pdf, miss = q * f_E, q * (1 - F_E_end) + (1 - q)
     else:
-        p = column["lapse_prob"]
-        f_L, S_L = _lapse(rt, p, floor, window, lapse_dist, lapse_tau, lapse_shape)
-        if model is GatedDiffusionMixture:
+        p = lapse.prob
+        f_L, S_L = _lapse_pdf_sf(rt, lapse, floor, window)
+        if variant is GatedDiffusionMixture:
             pdf = q * f_E + (1 - q) * f_L
             miss = q * (1 - F_E_end) + (1 - q) * (1 - p)
-        elif model is GatedDiffusionRace:
+        elif variant is GatedDiffusionRace:
             pdf = q * (f_E * S_L + f_L * (1 - F_E)) + (1 - q) * f_L
             miss = (q * (1 - F_E_end) + (1 - q)) * (1 - p)
     pdf, miss = pdf / not_early, miss / not_early
@@ -165,9 +160,10 @@ def log_likelihood(theta, names, stim_index, contrast, hit, rt, model=GatedDiffu
 
 # --- fits ---
 
-# Gaussian approximation to the posterior around its mode (Laplace), built in sbi's
-# unconstrained parameter space so that samples always respect the prior bounds
-def _laplace(potential, prior, num_samples, num_starts=500):
+def _laplace(potential: Callable[[Tensor, None], Tensor], prior: BoxUniform, num_samples: int,
+             num_starts: int = 500) -> Tensor:
+    """ Gaussian approximation to the posterior at its mode (Laplace) """
+    # built in sbi's unconstrained parameter space, so samples always respect the prior bounds
     transform = mcmc_transform(prior)                   # theta -> unconstrained z
 
     def neg_log_posterior(z):                           # z: (n, n_params), density over z
@@ -194,23 +190,23 @@ def _laplace(potential, prior, num_samples, num_starts=500):
     return transform.inv(gaussian.sample((num_samples,)))
 
 
-# trial-level Bayesian fit of behavior: samples from the posterior over the model parameters
-# stim, contrast, hit, rt: one entry per trial (rt is ignored on misses)
-# method: "nuts" samples the posterior with sbi's NUTS sampler (exact, minutes);
-#         "laplace" approximates it with a Gaussian at the mode (seconds, for prototyping)
-# lapse_dist, lapse_tau, lapse_shape: as in `build_model`. saturating: as in `param_names`
-# fixed: optional dict parameter name -> value of parameters held fixed and not sampled, e.g. lapse_prob
-#        at the catch-trial hit rate, or t0 at the floor. The returned samples carry them as constant columns
-# The prior is uniform over `param_bounds`.
-# returns posterior samples as a DataFrame: one row per draw, one column per parameter of `param_names`
-def fit_trials(stim, contrast, hit, rt, model=GatedDiffusion, task=None, method="nuts",
-               lapse_dist="uniform", lapse_tau=None, lapse_shape=None, saturating=True, fixed=None,
-               num_samples=2000, num_chains=4, warmup_steps=500):
+def fit_trials(stim: np.ndarray, contrast: np.ndarray, hit: np.ndarray, rt: np.ndarray,
+               variant: type[GatedDiffusion] = GatedDiffusion, task: TaskParams | None = None,
+               method: Literal["nuts", "laplace"] = "nuts", lapse: LapseParams | None = None,
+               saturating: bool = True, fixed: Params | None = None,
+               num_samples: int = 2000, num_chains: int = 4, warmup_steps: int = 500) -> pl.DataFrame:
+    """ Posterior samples: one row per draw, one column per parameter. Uniform prior over BOUNDS
+
+    stim, contrast, hit, rt: one entry per trial (rt is ignored on misses)
+    method: "nuts" (sbi's NUTS sampler, minutes) or "laplace" (Gaussian at the mode, seconds)
+    lapse: needed by the lapse variants. Measured, not sampled
+    fixed: parameters held fixed, returned as constant columns
+    """
     stims = list(np.unique(stim))
-    names = param_names(stims, model, saturating)
-    fixed = _fixed(fixed, names)
+    names = param_names(stims, saturating)
+    fixed = _check_fixed(fixed, names)
     stim_index = torch.as_tensor(np.searchsorted(stims, stim))
-    contrast, hit, rt = (torch.tensor(np.asarray(x)) for x in (contrast, hit, rt))     # copies: the inputs may be read-only
+    contrast, hit, rt = (torch.tensor(np.asarray(x)) for x in (contrast, hit, rt))     # copies: inputs may be read-only
     low, high = (torch.tensor(bound) for bound in param_bounds(names))
     sampled = [i for i, name in enumerate(names) if name not in fixed]
     prior = BoxUniform(low[sampled], high[sampled])
@@ -226,8 +222,9 @@ def fit_trials(stim, contrast, hit, rt, model=GatedDiffusion, task=None, method=
     # unnormalised log posterior, for one row of theta per chain
     def potential(theta, x_o):
         theta = torch.atleast_2d(theta).double()
-        return prior.log_prob(theta) + log_likelihood(complete(theta), names, stim_index, contrast, hit, rt, model, task,
-                                                      lapse_dist, lapse_tau, lapse_shape)
+        log_lik = log_likelihood(complete(theta), names, stim_index, contrast, hit, rt,
+                                 variant, task, lapse)
+        return prior.log_prob(theta) + log_lik
 
     if method == "laplace":
         samples = _laplace(potential, prior, num_samples)
@@ -245,17 +242,21 @@ def fit_trials(stim, contrast, hit, rt, model=GatedDiffusion, task=None, method=
     return pl.DataFrame(complete(samples).numpy(), schema=names, orient="row")
 
 
-# MAP estimate: the prior is uniform, so it is the parameters of highest likelihood.
-# Found by climbing from the posterior mean over the fitted parameters
-# posterior: samples from `fit_trials`. fitted: names of the fitted parameters
-# build: parameters -> model, with the task window and lapse shape used in the fit
-# returns the parameters (name -> value) and their log-likelihood
-def map_estimate(posterior, fitted, build, stim, contrast, hit, rt):
+def map_estimate(posterior: pl.DataFrame, fitted: list[str], build: Callable[[Params], GatedDiffusion],
+                 stim: np.ndarray, contrast: np.ndarray, hit: np.ndarray, rt: np.ndarray) -> tuple[Params, float]:
+    """ Parameters of highest likelihood (the MAP, as the prior is uniform) and their log-likelihood
+
+    Climbs from the posterior mean over the fitted parameters (names in `fitted`)
+    """
     start = posterior.mean().row(0, named=True)
 
     def neg_log_lik(x):
-        value = -build(start | dict(zip(fitted, x))).log_likelihood(stim, contrast, hit, rt)
+        params = start | dict(zip(fitted, x))
+        model = build(params)
+        value = -model.log_likelihood(stim, contrast, hit, rt)
         return value if np.isfinite(value) else np.inf
 
-    result = minimize(neg_log_lik, [start[name] for name in fitted], method="Nelder-Mead", options=dict(xatol=1e-7, fatol=1e-7, maxiter=5000))
-    return start | dict(zip(fitted, (float(value) for value in result.x))), -result.fun
+    result = minimize(neg_log_lik, [start[name] for name in fitted], method="Nelder-Mead",
+                      options=dict(xatol=1e-7, fatol=1e-7, maxiter=5000))
+    map_params = start | {name: float(value) for name, value in zip(fitted, result.x)}
+    return map_params, -result.fun

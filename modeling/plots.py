@@ -1,32 +1,43 @@
+from typing import Callable
+
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
+from matplotlib.figure import Figure
 from sbi.analysis import pairplot
 from scipy.optimize import curve_fit
 
+from .fit import Params
+from .model import GatedDiffusion
 
-# three-parameter Weibull for the display curves. No floor term: percent correct is
-# baseline-normalised, so it is 0 at zero contrast (as in the manuscript's eq. 5).
+
 def weibull(c, alpha, beta, lapse):
+    """ Three-parameter Weibull for the display curves """
+    # no floor term: percent correct is baseline-normalised, so it is 0 at zero contrast
     return (1 - lapse) * (1 - np.exp(-(c / alpha) ** beta))
 
 
 def weibull_curve(c_pct, percent_correct):
-    params, _ = curve_fit(weibull, c_pct, percent_correct / 100, p0=[8, 2, 0.08], bounds=([0.1, 0.1, 0], [400, 20, 0.5]))
+    params, _ = curve_fit(weibull, c_pct, percent_correct / 100, p0=[8, 2, 0.08],
+                          bounds=([0.1, 0.1, 0], [400, 20, 0.5]))
     xx = np.logspace(0, 2, 300)
     return xx, weibull(xx, *params) * 100
 
 
-# baseline-normalised percent correct and median reaction time of hits per animal,
-# then mean and SD over animals, per stimulus and contrast
-# trials: animalid, stim_type, contrast, hit, rt (s)
-def summarise(trials):
-    baseline = trials.filter(pl.col("contrast") == 0).group_by("animalid").agg(pl.col("hit").mean().alias("baseline"))
+def summarise(trials: pl.DataFrame) -> pl.DataFrame:
+    """ Baseline-normalised percent correct and median hit rt per animal, then mean and SD over animals
+
+    trials: animalid, stim_type, contrast, hit, rt (s)
+    """
+    baseline = (trials.filter(pl.col("contrast") == 0)
+        .group_by("animalid").agg(pl.col("hit").mean().alias("baseline")))
+    percent_correct = (pl.col("hit_rate") - pl.col("baseline")) / (1 - pl.col("baseline")) * 100
     per_animal = (trials.filter(pl.col("contrast") > 0)
         .group_by(["animalid", "contrast", "stim_type"])
-        .agg(pl.col("hit").mean().alias("hit_rate"), (pl.col("rt").filter(pl.col("hit")).median() * 1000).alias("median_rt"))
+        .agg(pl.col("hit").mean().alias("hit_rate"),
+             (pl.col("rt").filter(pl.col("hit")).median() * 1000).alias("median_rt"))
         .join(baseline, on="animalid")
-        .with_columns(((pl.col("hit_rate") - pl.col("baseline")) / (1 - pl.col("baseline")) * 100).alias("percent_correct")))
+        .with_columns(percent_correct.alias("percent_correct")))
     return (per_animal.group_by(["contrast", "stim_type"])
         .agg(pl.col("percent_correct").mean().alias("pc_mean"), pl.col("percent_correct").std().alias("pc_sd"),
              pl.col("median_rt").mean().alias("rt_mean"), pl.col("median_rt").std().alias("rt_sd"),
@@ -34,43 +45,59 @@ def summarise(trials):
         .sort(["stim_type", "contrast"]))
 
 
-# marginals on the diagonal, joint contours above it, MAP estimate in red
-# posterior: samples, one column per parameter. theta_map: dict parameter name -> value
-# order: names of the parameters to draw
-def posterior_pairplot(posterior, theta_map, order, figsize=(6, 6)):
+def posterior_pairplot(posterior: pl.DataFrame, map_params: Params, order: list[str],
+                       figsize: tuple[float, float] = (6, 6)) -> Figure:
+    """ Marginals on the diagonal, joint contours above it, MAP estimate in red
+
+    posterior: samples, one column per parameter. order: names of the parameters to draw
+    """
     labels = [name.replace("_", "\n") for name in order]
-    fig, axes = pairplot(posterior.select(order).to_numpy(), upper="contour", diag="kde", labels=labels, figsize=figsize,
-                         diag_kwargs=dict(mpl_kwargs=dict(color="k")), upper_kwargs=dict(mpl_kwargs=dict(colors="k")),
-                         points=np.array([[theta_map[name] for name in order]]), fig_kwargs=dict(points_colors=["#D62728"], points_offdiag=dict(marker="+", markersize=10, mew=1.5)))
-    fig.legend(handles=[plt.Line2D([], [], color="#D62728", label="MAP")], loc="lower left", bbox_to_anchor=(0.12, 0.15), frameon=False)
+    fig, axes = pairplot(posterior.select(order).to_numpy(), upper="contour", diag="kde", labels=labels,
+                         figsize=figsize, diag_kwargs=dict(mpl_kwargs=dict(color="k")),
+                         upper_kwargs=dict(mpl_kwargs=dict(colors="k")),
+                         points=np.array([[map_params[name] for name in order]]),
+                         fig_kwargs=dict(points_colors=["#D62728"],
+                                         points_offdiag=dict(marker="+", markersize=10, mew=1.5)))
+    fig.legend(handles=[plt.Line2D([], [], color="#D62728", label="MAP")], loc="lower left",
+               bbox_to_anchor=(0.12, 0.15), frameon=False)
     return fig
 
 
-# top row: summary points (mean ± SD over animals) with a Weibull display curve, for the data ("Empirical")
-#   and for simulated datasets ("Model"): one dataset per posterior draw, with the same trials as the data,
-#   summarised like the data and averaged
-# bottom rows: reaction times of hits per stimulus and contrast (catch trials are the 0% column).
-#   Bars are the data, lines are model densities. Each is normalised to unit area
-# trials: animalid, stim_type, contrast, hit, rt (s). build: parameters (name -> value) -> model
-# draws: posterior draws to simulate from, one row per simulated dataset
-# lines: dict label -> (model, line style), the densities drawn in the bottom rows
-def predictive_figure(trials, build, draws, lines, palette):
+def predictive_figure(trials: pl.DataFrame, build: Callable[[Params], GatedDiffusion], draws: pl.DataFrame,
+                      lines: dict[str, tuple[GatedDiffusion, str]], palette: dict[str, str]) -> Figure:
+    """ Psychometric and chronometric summaries (top) and hit rt distributions (bottom), data against model
+
+    trials: animalid, stim_type, contrast, hit, rt (s)
+    draws: posterior draws, one simulated dataset each, summarised like the data and averaged ("Model" panels)
+    lines: label -> (model, line style), the densities drawn over the rt histograms
+    palette: stim_type -> colour
+    """
     stim, contrast = trials["stim_type"].to_numpy().astype(str), trials["contrast"].to_numpy()
     summaries = []
     for theta in draws.iter_rows(named=True):
         sim_hit, sim_rt = build(theta).simulate(stim, contrast)
-        summaries.append(summarise(trials.with_columns(pl.Series("hit", sim_hit[0]), pl.Series("rt", sim_rt[0]))))
+        simulated = trials.with_columns(
+            pl.Series("hit", sim_hit[0]),
+            pl.Series("rt", sim_rt[0]),
+        )
+        summaries.append(summarise(simulated))
     sim_summary = pl.concat(summaries).group_by(["contrast", "stim_type"]).mean().sort(["stim_type", "contrast"])
 
     contrasts = np.sort(trials["contrast"].unique().to_numpy())
 
     # a 28-column grid holds 4 panels in the top row and one panel per contrast (7) in the two rows below
     fig = plt.figure(figsize=(14, 8.4))
-    grid = fig.add_gridspec(3, 28, height_ratios=[1.5, 1, 1], left=0.06, right=0.99, top=0.96, bottom=0.07, hspace=0.5, wspace=0.8)
+    grid = fig.add_gridspec(3, 28, height_ratios=[1.5, 1, 1], left=0.06, right=0.99, top=0.96, bottom=0.07,
+                            hspace=0.5, wspace=0.8)
 
-    # top row
-    axes = [fig.add_subplot(grid[0, 7 * i + (i > 0) : 7 * i + 6]) for i in range(4)]
-    for (ax_pc, ax_rt), (label, summary) in zip([axes[:2], axes[2:]], [("Empirical", summarise(trials)), ("Model", sim_summary)]):
+    # top row: mean ± SD over animals, with a Weibull display curve
+    axes = []
+    for i in range(4):
+        first_column = 7 * i + (1 if i > 0 else 0)
+        last_column = 7 * i + 6
+        axes.append(fig.add_subplot(grid[0, first_column:last_column]))
+    panels = [("Empirical", summarise(trials)), ("Model", sim_summary)]
+    for (ax_pc, ax_rt), (label, summary) in zip([axes[:2], axes[2:]], panels):
         for stim_type, color in palette.items():
             s = summary.filter(pl.col("stim_type") == stim_type)
             c_pct = s["contrast"].to_numpy() * 100
@@ -88,7 +115,7 @@ def predictive_figure(trials, build, draws, lines, palette):
             ax.set_xlabel("Contrast (%)")
             ax.spines[["top", "right"]].set_visible(False)
 
-    # bottom rows, over the observation window of the models
+    # bottom rows: hit rt per stimulus and contrast (0% is the catch trials), each normalised to unit area
     task = next(iter(lines.values()))[0].task
     bins = np.arange(task.floor, task.deadline + 1e-9, 0.035)
     rt_grid = np.linspace(task.floor + 1e-4, task.deadline, 300)
@@ -100,11 +127,13 @@ def predictive_figure(trials, build, draws, lines, palette):
             axes[i, j].tick_params(labelbottom=i == 1, labelleft=j == 0)
     for row, (stim_type, color) in zip(axes, palette.items()):
         for ax, c in zip(row, contrasts):
-            empirical = trials.filter((pl.col("stim_type") == stim_type) & (pl.col("contrast") == c) & pl.col("hit"))["rt"].to_numpy()
+            hits = (pl.col("stim_type") == stim_type) & (pl.col("contrast") == c) & pl.col("hit")
+            empirical = trials.filter(hits)["rt"].to_numpy()
             ax.hist(empirical, bins=bins, density=True, color=color, alpha=0.45, label="data")
             cc = np.array([c])
             for label, (m, style) in lines.items():
-                ax.plot(rt_grid, m.rt_pdf(stim_type, cc, rt_grid) / m.hit_prob(stim_type, cc), color="k", lw=1.2, ls=style, label=label)
+                density = m.rt_pdf(stim_type, cc, rt_grid) / m.hit_prob(stim_type, cc)
+                ax.plot(rt_grid, density, color="k", lw=1.2, ls=style, label=label)
             ax.set_title(f"{c * 100:.3g}%  n={len(empirical)}", fontsize=8)
             ax.spines[["top", "right"]].set_visible(False)
         row[0].set_ylabel(f"{stim_type}\ndensity", fontsize=9)
@@ -128,10 +157,11 @@ def _zero_contrast_axis(ax):
                 transform=ax.get_xaxis_transform(), clip_on=False)
 
 
-# left: gate probability, one curve per stimulus, dashed line at its scale, dotted line at the ceiling
-# right: drift, shared by both stimuli, dashed line at c50, dotted line at the gain
-# model: a model with a saturating drift. contrasts: the tested contrasts, marked with dots
-def gate_drift_figure(model, contrasts, palette):
+def gate_drift_figure(model: GatedDiffusion, contrasts: np.ndarray, palette: dict[str, str]) -> Figure:
+    """ Gate probability per stimulus (left) and the shared drift (right), for a model with a saturating drift
+
+    Dashed lines: gate scale and c50. Dotted lines: ceiling and gain. Dots: the tested contrasts
+    """
     c_fine = np.logspace(-4, 0, 400)        # down to 0.01%, where the gates are close to 0
     tested = contrasts[contrasts > 0]
     zero = np.array([0.0])
@@ -157,7 +187,8 @@ def gate_drift_figure(model, contrasts, palette):
     ax_drift.text(c_fine[0] * 110, gain * 1.02, f"gain {gain:.2f}", fontsize=8, color="0.4", va="bottom")
     ax_drift.axvline(c50 * 100, color="k", ls="--", lw=0.8)
     ax_drift.text(c50 * 108, 0.3, f"c50 {c50 * 100:.1f}%", fontsize=8)
-    ax_drift.set(xscale="log", ylim=(0, gain * 1.12), xlabel="Contrast (%)", ylabel="Drift v(c)", title="Drift (Naka-Rushton)")
+    ax_drift.set(xscale="log", ylim=(0, gain * 1.12), xlabel="Contrast (%)", ylabel="Drift v(c)",
+                 title="Drift (Naka-Rushton)")
 
     for ax in (ax_gate, ax_drift):
         _zero_contrast_axis(ax)
